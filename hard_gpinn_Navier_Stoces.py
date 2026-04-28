@@ -11,26 +11,14 @@ import tensorflow as tf
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 os.environ['XLA_FLAGS'] = '--xla_cpu_multi_thread_eigen=false --xla_hlo_profile=false'
 
-# Установка float32 как типа по умолчанию
 dde.config.set_default_float('float32')
 dde.config.set_random_seed(42)
 tf.config.optimizer.set_jit(False)
 
-
-# ============================================================
-# gPINN Navier-Stokes: труба с линейным сужением в середине
-# ============================================================
-
-# -------------------------
-# 1. Настройки
-# -------------------------
-
-# Физика
 RHO = 1.0
 NU = 0.02
 U_MAX = 1.0
 
-# Геометрия
 L = 2.0
 H_IN = 0.50
 H_THROAT = 0.25
@@ -39,7 +27,6 @@ X_CONTRACT_2 = 0.90
 X_EXPAND_1 = 1.10
 X_EXPAND_2 = 1.25
 
-# Обучение
 N_DOMAIN = 1500
 N_BOUNDARY = 400
 N_TEST = 400
@@ -54,7 +41,6 @@ ITERATIONS_ADAM = 4000
 DISPLAY_EVERY = 500
 USE_LBFGS = False
 
-# Вывод
 MODEL_NAME = "gpinn_navier_stokes_constricted"
 OUT_DIR = f"{MODEL_NAME}_outputs"
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -62,10 +48,6 @@ os.makedirs(OUT_DIR, exist_ok=True)
 GRID_NX = 420
 GRID_NY = 140
 
-
-# -------------------------
-# 2. Геометрия
-# -------------------------
 
 points = [
     [0.0, H_IN],
@@ -101,36 +83,16 @@ def half_height_numpy(x):
     return h
 
 
-# -------------------------
-# 3. Теоретический профиль Пуазейля для сравнения
-# -------------------------
-
 def poiseuille_profile(y, h, u_max=U_MAX):
-    """
-    Профиль Пуазейля для канала высотой 2h
-    u(y) = u_max * (1 - (y/h)^2)
-    """
     y = np.asarray(y)
     return u_max * (1.0 - (y / h) ** 2)
 
 
 def get_local_poiseuille_profile(x, y):
-    """
-    Локальный профиль Пуазейля с учетом переменной высоты канала
-    Используется только для входного и выходного сечений
-    """
     h_local = half_height_numpy(x)
     return poiseuille_profile(y, h_local, U_MAX)
 
-
-# -------------------------
-# 4. gPINN: Уравнения Навье-Стокса + градиенты
-# -------------------------
-
 def navier_stokes_with_gradients(x, y):
-    """
-    gPINN: возвращает невязки PDE и их градиенты по x и y
-    """
     u = tf.cast(y[:, 0:1], tf.float32)
     v = tf.cast(y[:, 1:2], tf.float32)
     p = tf.cast(y[:, 2:3], tf.float32)
@@ -149,16 +111,13 @@ def navier_stokes_with_gradients(x, y):
     v_xx = tf.cast(dde.grad.hessian(v, x, i=0, j=0), tf.float32)
     v_yy = tf.cast(dde.grad.hessian(v, x, i=0, j=1), tf.float32)
     
-    # Константы
     RHO_f32 = tf.constant(RHO, dtype=tf.float32)
     NU_f32 = tf.constant(NU, dtype=tf.float32)
     
-    # Невязки PDE
     momentum_x = u * u_x + v * u_y + p_x / RHO_f32 - NU_f32 * (u_xx + u_yy)
     momentum_y = u * v_x + v * v_y + p_y / RHO_f32 - NU_f32 * (v_xx + v_yy)
     continuity = u_x + v_y
     
-    # Градиенты невязок (gPINN)
     g_mom_x_x = tf.cast(dde.grad.jacobian(momentum_x, x, i=0, j=0), tf.float32)
     g_mom_x_y = tf.cast(dde.grad.jacobian(momentum_x, x, i=0, j=1), tf.float32)
     g_mom_y_x = tf.cast(dde.grad.jacobian(momentum_y, x, i=0, j=0), tf.float32)
@@ -169,10 +128,6 @@ def navier_stokes_with_gradients(x, y):
     return [momentum_x, momentum_y, continuity,
             g_mom_x_x, g_mom_x_y, g_mom_y_x, g_mom_y_y, g_cont_x, g_cont_y]
 
-
-# -------------------------
-# 5. Граничные условия
-# -------------------------
 
 def inlet(x, on_boundary):
     return on_boundary and np.isclose(x[0], 0.0)
@@ -204,10 +159,6 @@ bcs = [
 ]
 
 
-# -------------------------
-# 6. Данные и сеть
-# -------------------------
-
 data = dde.data.PDE(
     geom,
     navier_stokes_with_gradients,
@@ -226,11 +177,6 @@ loss_weights = [
     0.1, 0.1, 0.1, 0.1, 0.1, 0.1,
     20.0, 20.0, 5.0, 30.0, 30.0,
 ]
-
-
-# -------------------------
-# 7. Обучение
-# -------------------------
 
 def train_model():
     print("=" * 60)
@@ -260,10 +206,6 @@ def train_model():
 
     return losshistory, train_state
 
-
-# -------------------------
-# 8. Вспомогательные функции
-# -------------------------
 
 def _stack_operator_result(res):
     if isinstance(res, list):
@@ -303,9 +245,6 @@ def predict_on_grid(nx=GRID_NX, ny=GRID_NY):
             cont.reshape(xx.shape))
 
 
-# -------------------------
-# 9. Графики
-# -------------------------
 
 def draw_geometry(ax):
     poly = np.array(points + [points[0]])
