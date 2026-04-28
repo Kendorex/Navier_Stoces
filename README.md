@@ -1,8 +1,18 @@
+# Уравнения Навье–Стокса (2D, несжимаемая жидкость)
+
+## Уравнение неразрывности
+
+$$
+\frac{\partial u}{\partial x} + \frac{\partial v}{\partial y} = 0
+$$
+
+---
+
 ## Уравнения импульса
 
 ### X-компонента
 
-![x-momentum](https://latex.codecogs.com/png.image?\dpi{120}
+$$
 \frac{\partial u}{\partial t}
 + u \frac{\partial u}{\partial x}
 + v \frac{\partial u}{\partial y}
@@ -10,11 +20,12 @@
 + \nu \left(
 \frac{\partial^2 u}{\partial x^2}
 + \frac{\partial^2 u}{\partial y^2}
-\right))
+\right)
+$$
 
 ### Y-компонента
 
-![y-momentum](https://latex.codecogs.com/png.image?\dpi{120}
+$$
 \frac{\partial v}{\partial t}
 + u \frac{\partial v}{\partial x}
 + v \frac{\partial v}{\partial y}
@@ -22,4 +33,36 @@
 + \nu \left(
 \frac{\partial^2 v}{\partial x^2}
 + \frac{\partial^2 v}{\partial y^2}
-\right))
+\right)
+$$
+
+---
+
+## Векторная форма
+
+$$
+\frac{\partial \mathbf{u}}{\partial t}
++ (\mathbf{u} \cdot \nabla)\mathbf{u}
+= -\frac{1}{\rho} \nabla p
++ \nu \nabla^2 \mathbf{u}
+$$
+
+$$
+\nabla \cdot \mathbf{u} = 0
+$$
+
+---
+
+## Стационарная форма (для gPINN)
+
+$$
+u u_x + v u_y + \frac{1}{\rho} p_x - \nu (u_{xx} + u_{yy}) = 0
+$$
+
+$$
+u v_x + v v_y + \frac{1}{\rho} p_y - \nu (v_{xx} + v_{yy}) = 0
+$$
+
+$$
+u_x + v_y = 0
+$$
