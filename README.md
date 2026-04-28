@@ -2,7 +2,7 @@
 
 ## Уравнение неразрывности
 
-$\frac{\partial u}{\partial x} + \frac{\partial v}{\partial y} = 0$
+```\frac{\partial u}{\partial x} + \frac{\partial v}{\partial y} = 0$```
 
 ---
 
