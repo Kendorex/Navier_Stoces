@@ -1,0 +1,19 @@
+# Core dependencies
+tensorflow==2.13.0
+numpy>=1.24.0,<1.25.0  # Фиксируем версию для совместимости
+
+# DeepXDE and its dependencies
+deepxde>=1.9.0
+tensorflow-probability==0.21.0  # Должен соответствовать версии tensorflow
+
+# Scientific computing
+scipy>=1.10.0
+
+# Data visualization and analysis
+matplotlib>=3.7.0
+pandas>=2.0.0
+
+# Performance and debugging
+tqdm>=4.65.0
+
+imageio
