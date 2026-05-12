@@ -452,26 +452,24 @@ def plot_profiles(filename=None, n=250):
 # 10. Сравнение gPINN с теорией Пуазейля
 # -------------------------
 
-def plot_gpinn_vs_poiseuille(filename=None, n_profile=200):
+def plot_gpinn_vs_poiseuille_combined(filename=None, n_profile=200):
     """
-    Сравнение решения gPINN с теоретическим профилем Пуазейля
-    на входном и выходном участках канала
+    Единый график сравнения gPINN с теорией Пуазейля
     """
     if filename is None:
-        filename = os.path.join(OUT_DIR, "gpinn_vs_poiseuille.png")
+        filename = os.path.join(OUT_DIR, "gpinn_vs_poiseuille_combined.png")
     
     # Сечения для сравнения
     cuts = [
-        (0.1, "x = 0.10 (вход)"),
-        (0.5, "x = 0.50 (до сужения)"),
-        (1.5, "x = 1.50 (после расширения)"),
-        (1.9, "x = 1.90 (выход)")
+        (0.1, "x = 0.10 (вход)", 'blue'),
+        (0.5, "x = 0.50 (до сужения)", 'green'),
+        (1.5, "x = 1.50 (после расширения)", 'orange'),
+        (1.9, "x = 1.90 (выход)", 'red')
     ]
     
-    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
-    axes = axes.ravel()
+    fig, ax = plt.subplots(figsize=(10, 7))
     
-    for idx, (x_cut, title) in enumerate(cuts):
+    for x_cut, label, color in cuts:
         h_local = float(half_height_numpy(np.array([x_cut]))[0])
         y = np.linspace(-h_local * 0.99, h_local * 0.99, n_profile)[:, None].astype(np.float32)
         x_col = np.full_like(y, x_cut, dtype=np.float32)
@@ -487,19 +485,24 @@ def plot_gpinn_vs_poiseuille(filename=None, n_profile=200):
         # Ошибка
         error = np.mean(np.abs(u_gpinn - u_theory))
         
-        axes[idx].plot(u_gpinn, y, 'b-', linewidth=2, label=f'gPINN (error={error:.4f})')
-        axes[idx].plot(u_theory, y, 'r--', linewidth=2, label='Poiseuille theory')
-        axes[idx].set_xlabel('u(x, y)')
-        axes[idx].set_ylabel('y')
-        axes[idx].set_title(title)
-        axes[idx].legend()
-        axes[idx].grid(True, alpha=0.3)
-        
-        # Добавляем границы канала
-        axes[idx].axhline(y=h_local, color='k', linestyle='-', alpha=0.5)
-        axes[idx].axhline(y=-h_local, color='k', linestyle='-', alpha=0.5)
+        # Рисуем gPINN
+        ax.plot(u_gpinn, y, color=color, linewidth=2.5, 
+                label=f'gPINN {label} (error={error:.4f})')
+        # Рисуем теорию (пунктиром)
+        ax.plot(u_theory, y, color=color, linestyle='--', linewidth=1.5, alpha=0.7)
     
-    plt.suptitle('gPINN vs Poiseuille Theory: Профили скорости в различных сечениях', fontsize=12)
+    ax.set_xlabel('u(x, y)', fontsize=12)
+    ax.set_ylabel('y', fontsize=12)
+    ax.set_title('gPINN (сплошные линии) vs Poiseuille Theory (пунктир)\nСравнение профилей скорости', fontsize=14)
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    
+    # Добавляем информацию о параметрах
+    Re = U_MAX * 2 * H_IN / NU
+    text_str = f'Параметры задачи:\nRe = {Re:.1f}\nν = {NU}\nU_max = {U_MAX}\nH_in = {H_IN}\nH_throat = {H_THROAT}'
+    ax.text(0.02, 0.98, text_str, transform=ax.transAxes, fontsize=10,
+            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
     plt.tight_layout()
     plt.savefig(filename, dpi=170)
     plt.close()
@@ -656,7 +659,7 @@ def create_all_outputs(losshistory):
     plot_profiles()
     
     # Дополнительные графики сравнения с теорией Пуазейля
-    plot_gpinn_vs_poiseuille()
+    plot_gpinn_vs_poiseuille_combined()
     plot_error_analysis()
     plot_poiseuille_comparison_summary()
     

@@ -1,0 +1,6 @@
+==================================================
+PINN for Navier-Stokes in Constricted Channel
+==================================================
+Timestamp: 2026-05-12 11:13:30
+
+Physical Parameters:
