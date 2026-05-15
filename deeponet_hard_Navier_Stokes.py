@@ -1,11 +1,14 @@
 import torch
 import torch.nn as nn
+import torch.optim as optim
 import matplotlib.pyplot as plt
 import numpy as np
 import os
+import gc
+from matplotlib.colors import Normalize
 
 # ============================================
-# DeepONet + PINN для 2D течения в сужающейся трещине
+# УЛУЧШЕННАЯ ВЕРСИЯ 2.2: DeepONet + PINN
 # ============================================
 
 # Параметры геометрии с сужением
@@ -20,11 +23,17 @@ X_EXPAND_2 = 1.25
 # Физические параметры
 RHO = 1.0
 NU = 0.02
-U_MAX = 1.0
 
 # Директория для сохранения
-OUT_DIR = "deeponet_constricted_outputs"
+OUT_DIR = "deeponet_constricted_v2"
 os.makedirs(OUT_DIR, exist_ok=True)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Используется устройство: {device}")
+
+# Очистка памяти GPU перед стартом
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    gc.collect()
 
 # ============================================
 # 1. Геометрия сужающейся трещины
@@ -32,86 +41,128 @@ os.makedirs(OUT_DIR, exist_ok=True)
 def channel_width(x):
     """Полуширина канала в точке x"""
     if isinstance(x, torch.Tensor):
+        was_tensor = True
         x_np = x.detach().cpu().numpy()
+        device_orig = x.device
     else:
+        was_tensor = False
         x_np = np.asarray(x, dtype=np.float64)
     
-    w = np.zeros_like(x_np, dtype=np.float64)
+    w = np.full_like(x_np, H_IN/2, dtype=np.float64)
     
-    for i, xi in enumerate(x_np.flat):
-        if xi <= X_CONTRACT_1:
-            w.flat[i] = H_IN / 2
-        elif xi <= X_CONTRACT_2:
-            t = (xi - X_CONTRACT_1) / (X_CONTRACT_2 - X_CONTRACT_1)
-            t_smooth = 10*t**3 - 15*t**4 + 6*t**5
-            w.flat[i] = (H_IN/2)*(1-t_smooth) + (H_THROAT/2)*t_smooth
-        elif xi <= X_EXPAND_1:
-            w.flat[i] = H_THROAT / 2
-        elif xi <= X_EXPAND_2:
-            t = (xi - X_EXPAND_1) / (X_EXPAND_2 - X_EXPAND_1)
-            t_smooth = 10*t**3 - 15*t**4 + 6*t**5
-            w.flat[i] = (H_THROAT/2)*(1-t_smooth) + (H_IN/2)*t_smooth
-        else:
-            w.flat[i] = H_IN / 2
+    # Сужение
+    mask_contract = (x_np > X_CONTRACT_1) & (x_np <= X_CONTRACT_2)
+    if mask_contract.any():
+        t_contract = (x_np[mask_contract] - X_CONTRACT_1) / (X_CONTRACT_2 - X_CONTRACT_1)
+        t_smooth_contract = np.sin(np.pi * t_contract / 2)**2
+        w[mask_contract] = (H_IN/2)*(1-t_smooth_contract) + (H_THROAT/2)*t_smooth_contract
     
-    w = w.reshape(x_np.shape)
+    # Горло
+    mask_throat = (x_np > X_CONTRACT_2) & (x_np <= X_EXPAND_1)
+    if mask_throat.any():
+        w[mask_throat] = H_THROAT / 2
     
-    if isinstance(x, torch.Tensor):
-        return torch.tensor(w, device=x.device, dtype=torch.float32)
+    # Расширение
+    mask_expand = (x_np > X_EXPAND_1) & (x_np <= X_EXPAND_2)
+    if mask_expand.any():
+        t_expand = (x_np[mask_expand] - X_EXPAND_1) / (X_EXPAND_2 - X_EXPAND_1)
+        t_smooth_expand = np.sin(np.pi * t_expand / 2)**2
+        w[mask_expand] = (H_THROAT/2)*(1-t_smooth_expand) + (H_IN/2)*t_smooth_expand
+    
+    if was_tensor:
+        return torch.tensor(w, device=device_orig, dtype=torch.float32)
     return w
 
-def is_inside_channel(x, y):
-    """Проверяет, находится ли точка внутри канала"""
-    return torch.abs(y) <= channel_width(x)
-
 # ============================================
-# 2. Архитектура DeepONet
+# 2. Архитектура DeepONet с оптимизацией памяти
 # ============================================
-class DeepONet2D(nn.Module):
-    def __init__(self, n_sensors=20, hidden_dim=64):
+class ImprovedDeepONet2D(nn.Module):
+    def __init__(self, n_sensors=20, hidden_dim=128, n_layers=3):
         super().__init__()
-        # Branch: обрабатывает входную функцию (профиль скорости на входе)
-        self.branch = nn.Sequential(
-            nn.Linear(n_sensors, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim)
+        
+        self.fourier_features = 32
+        self.trunk_input_dim = 2 + 4 * self.fourier_features
+        
+        # Branch network
+        branch_layers = []
+        input_dim = n_sensors
+        
+        for i in range(n_layers):
+            branch_layers.append(nn.Linear(input_dim if i == 0 else hidden_dim, hidden_dim))
+            branch_layers.append(nn.LayerNorm(hidden_dim))
+            branch_layers.append(nn.GELU())
+            if i < n_layers - 1:
+                branch_layers.append(nn.Dropout(0.1))
+        
+        self.branch = nn.Sequential(*branch_layers)
+        
+        # Trunk network
+        trunk_layers = []
+        trunk_layers.append(nn.Linear(self.trunk_input_dim, hidden_dim))
+        trunk_layers.append(nn.LayerNorm(hidden_dim))
+        trunk_layers.append(nn.GELU())
+        
+        for i in range(n_layers - 1):
+            trunk_layers.append(nn.Linear(hidden_dim, hidden_dim))
+            trunk_layers.append(nn.LayerNorm(hidden_dim))
+            trunk_layers.append(nn.GELU())
+            if i < n_layers - 2:
+                trunk_layers.append(nn.Dropout(0.05))
+        
+        self.trunk = nn.Sequential(*trunk_layers)
+        
+        # Final layers
+        self.final = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 1)
         )
         
-        # Trunk: обрабатывает координаты (x, y)
-        self.trunk = nn.Sequential(
-            nn.Linear(2, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0.01)
+    
+    def _add_fourier_features(self, coords):
+        batch_size, n_points, _ = coords.shape
         
-        # Инициализация
-        for net in [self.branch, self.trunk]:
-            for layer in net:
-                if isinstance(layer, nn.Linear):
-                    nn.init.xavier_uniform_(layer.weight)
-                    nn.init.zeros_(layer.bias)
+        freqs = torch.exp(torch.linspace(0, np.log(8), self.fourier_features, device=coords.device))
         
+        x = coords[..., 0:1]
+        y = coords[..., 1:2]
+        
+        x_ff = x * freqs.view(1, 1, -1)
+        y_ff = y * freqs.view(1, 1, -1)
+        
+        ff = torch.cat([torch.sin(x_ff), torch.cos(x_ff), torch.sin(y_ff), torch.cos(y_ff)], dim=-1)
+        
+        return torch.cat([coords, ff], dim=-1)
+    
     def forward(self, sensor_vals, coords):
-        b = self.branch(sensor_vals)    # (batch, hidden_dim)
-        t = self.trunk(coords)          # (batch, N, hidden_dim)
-        return torch.sum(b.unsqueeze(1) * t, dim=-1)  # (batch, N)
-
+        batch_size, n_points, _ = coords.shape
+        
+        coords_ff = self._add_fourier_features(coords)
+        
+        b = self.branch(sensor_vals)
+        t = self.trunk(coords_ff)
+        
+        b_expanded = b.unsqueeze(1)
+        product = b_expanded * t
+        
+        out = self.final(product).squeeze(-1)
+        
+        return out
 
 class NavierStokesDeepONet(nn.Module):
     def __init__(self, n_sensors=20):
         super().__init__()
-        self.u_net = DeepONet2D(n_sensors, hidden_dim=64)
-        self.v_net = DeepONet2D(n_sensors, hidden_dim=64)
-        self.p_net = DeepONet2D(n_sensors, hidden_dim=64)
-        
+        self.u_net = ImprovedDeepONet2D(n_sensors, hidden_dim=128, n_layers=3)
+        self.v_net = ImprovedDeepONet2D(n_sensors, hidden_dim=128, n_layers=3)
+        self.p_net = ImprovedDeepONet2D(n_sensors, hidden_dim=128, n_layers=3)
+    
     def forward(self, sensor_vals, coords):
         u = self.u_net(sensor_vals, coords)
         v = self.v_net(sensor_vals, coords)
@@ -119,106 +170,99 @@ class NavierStokesDeepONet(nn.Module):
         return u, v, p
 
 # ============================================
-# 3. Physics-Informed Loss
+# 3. Physics-Informed Loss с оптимизацией памяти
 # ============================================
 def navier_stokes_loss(model, sensor_vals, coords):
-    """Уравнения Навье-Стокса для несжимаемой жидкости"""
     coords = coords.detach().requires_grad_(True)
-    
     u, v, p = model(sensor_vals, coords)
     
-    # Градиенты
     ones = torch.ones_like(u)
     
-    grad_u = torch.autograd.grad(u, coords, grad_outputs=ones, create_graph=True)[0]
+    grad_u = torch.autograd.grad(u, coords, grad_outputs=ones, create_graph=True, retain_graph=True)[0]
     du_dx, du_dy = grad_u[..., 0], grad_u[..., 1]
     
-    grad_v = torch.autograd.grad(v, coords, grad_outputs=ones, create_graph=True)[0]
+    grad_v = torch.autograd.grad(v, coords, grad_outputs=ones, create_graph=True, retain_graph=True)[0]
     dv_dx, dv_dy = grad_v[..., 0], grad_v[..., 1]
     
-    grad_p = torch.autograd.grad(p, coords, grad_outputs=ones, create_graph=True)[0]
+    grad_p = torch.autograd.grad(p, coords, grad_outputs=ones, create_graph=True, retain_graph=True)[0]
     dp_dx, dp_dy = grad_p[..., 0], grad_p[..., 1]
     
-    # Вторые производные
-    d2u_dx2 = torch.autograd.grad(du_dx, coords, grad_outputs=ones, create_graph=True)[0][..., 0]
-    d2u_dy2 = torch.autograd.grad(du_dy, coords, grad_outputs=ones, create_graph=True)[0][..., 1]
-    d2v_dx2 = torch.autograd.grad(dv_dx, coords, grad_outputs=ones, create_graph=True)[0][..., 0]
-    d2v_dy2 = torch.autograd.grad(dv_dy, coords, grad_outputs=ones, create_graph=True)[0][..., 1]
+    du_dx_grad = torch.autograd.grad(du_dx, coords, grad_outputs=ones, create_graph=True, retain_graph=True)[0]
+    d2u_dx2 = du_dx_grad[..., 0]
+    d2u_dy2 = torch.autograd.grad(du_dy, coords, grad_outputs=ones, create_graph=True, retain_graph=True)[0][..., 1]
     
-    # Уравнения Навье-Стокса
+    dv_dx_grad = torch.autograd.grad(dv_dx, coords, grad_outputs=ones, create_graph=True, retain_graph=True)[0]
+    d2v_dx2 = dv_dx_grad[..., 0]
+    d2v_dy2 = torch.autograd.grad(dv_dy, coords, grad_outputs=ones, create_graph=True, retain_graph=True)[0][..., 1]
+    
     momentum_x = u*du_dx + v*du_dy + dp_dx/RHO - NU*(d2u_dx2 + d2u_dy2)
     momentum_y = u*dv_dx + v*dv_dy + dp_dy/RHO - NU*(d2v_dx2 + d2v_dy2)
     continuity = du_dx + dv_dy
     
-    return (torch.mean(momentum_x**2) + torch.mean(momentum_y**2) + 
-            2.0 * torch.mean(continuity**2))
+    loss = torch.mean(momentum_x**2) + torch.mean(momentum_y**2) + 2.0 * torch.mean(continuity**2)
+    
+    del grad_u, grad_v, grad_p, du_dx_grad
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    return loss
 
 # ============================================
 # 4. Генерация данных
 # ============================================
-def generate_constricted_data(n_samples=100, n_sensors=20):
-    """
-    Генерирует данные для течения в сужающейся трещине.
-    Каждый сэмпл - разная скорость на входе.
-    """
-    print(f"📊 Генерация {n_samples} сэмплов...")
+def generate_high_quality_data(n_samples=100, n_sensors=30):
+    print(f"Генерация {n_samples} сэмплов...")
     
     y_sensors = np.linspace(-H_IN/2, H_IN/2, n_sensors, dtype=np.float32)
-    
     all_sensors = np.zeros((n_samples, n_sensors), dtype=np.float32)
     all_coords = []
     all_u = []
     all_v = []
     all_p = []
     
-    # Сетка для CFD-подобного решения (упрощенное)
-    nx, ny = 40, 30
+    nx, ny = 50, 30
     x_grid = np.linspace(0, L, nx)
     
     for sample_idx in range(n_samples):
-        # Случайная скорость на входе
         u_inlet = np.random.uniform(0.3, 2.0)
         
-        # Сенсоры на входе (параболический профиль)
         sensor_vals = u_inlet * (1 - (2*y_sensors/H_IN)**2)
-        sensor_vals += np.random.normal(0, 0.005, n_sensors)
+        sensor_vals += np.random.normal(0, 0.002, n_sensors)
         all_sensors[sample_idx] = sensor_vals.astype(np.float32)
         
-        # Генерируем приближенное решение
         coords_list = []
         u_list = []
         v_list = []
         p_list = []
         
         for i, x in enumerate(x_grid):
-            h = channel_width(x)
-            y_grid_local = np.linspace(-h, h, ny)
+            h = max(channel_width(x), 0.01)
+            y_grid_local = np.linspace(-h*0.95, h*0.95, ny)
             
             for y in y_grid_local:
                 coords_list.append([x, y])
                 
-                # Приближенное решение:
-                # u(y) ~ параболический профиль, масштабированный по ширине
                 h_in = H_IN / 2
-                h_local = channel_width(x)
+                h_local = h
                 
-                # Сохранение массы: u_max * h = const
                 u_max_local = u_inlet * h_in / h_local
-                
-                # Параболический профиль
                 u_val = u_max_local * (1 - (y/h_local)**2)
                 
-                # v-компонента (из уравнения неразрывности)
-                if i > 0 and i < nx-1:
-                    h_prev = channel_width(x_grid[i-1])
-                    h_next = channel_width(x_grid[i+1])
+                if 0 < i < nx-1:
+                    h_prev = max(channel_width(x_grid[i-1]), 0.01)
+                    h_next = max(channel_width(x_grid[i+1]), 0.01)
                     dh_dx = (h_next - h_prev) / (x_grid[i+1] - x_grid[i-1])
-                    v_val = u_val * y / h_local * dh_dx
+                    
+                    if abs(dh_dx) > 1e-6:
+                        v_val = u_max_local * dh_dx * (y/h_local) * (1 - (y/h_local)**2/3) * 2/3
+                    else:
+                        v_val = 0.0
                 else:
                     v_val = 0.0
                 
-                # Давление (падает к выходу, ниже в горловине)
-                p_val = u_inlet * (1 - x/L) * (h_local/h_in)
+                p_dynamic = 0.5 * RHO * u_inlet**2 * (1 - (h_in/h_local)**2)
+                p_friction = 8 * NU * RHO * u_inlet * x / (h_in**2)
+                p_val = p_dynamic * (1 - x/L) - p_friction
                 
                 u_list.append(u_val)
                 v_list.append(v_val)
@@ -232,6 +276,15 @@ def generate_constricted_data(n_samples=100, n_sensors=20):
         if (sample_idx + 1) % 25 == 0:
             print(f"  Сгенерировано {sample_idx+1}/{n_samples} сэмплов")
     
+    max_len = max(len(c) for c in all_coords)
+    for i in range(len(all_coords)):
+        if len(all_coords[i]) < max_len:
+            pad_len = max_len - len(all_coords[i])
+            all_coords[i] = np.pad(all_coords[i], ((0, pad_len), (0, 0)), mode='edge')
+            all_u[i] = np.pad(all_u[i], (0, pad_len), mode='edge')
+            all_v[i] = np.pad(all_v[i], (0, pad_len), mode='edge')
+            all_p[i] = np.pad(all_p[i], (0, pad_len), mode='edge')
+    
     return (torch.FloatTensor(all_sensors),
             torch.FloatTensor(np.array(all_coords)),
             torch.FloatTensor(np.array(all_u)),
@@ -239,12 +292,207 @@ def generate_constricted_data(n_samples=100, n_sensors=20):
             torch.FloatTensor(np.array(all_p)))
 
 # ============================================
-# 5. Подготовка данных
+# 5. Генерация точек
 # ============================================
-print("📊 Генерация данных для сужающейся трещины...")
-sensors, coords, u_true, v_true, p_true = generate_constricted_data(100, 20)
+def generate_interior_points(batch_size, n_points, device):
+    x = torch.rand(batch_size, n_points, device=device) * L
+    y = (torch.rand(batch_size, n_points, device=device) - 0.5) * H_IN
+    
+    h = channel_width(x)
+    mask = torch.abs(y) > h
+    y[mask] = torch.sign(y[mask]) * h[mask] * 0.99
+    
+    return torch.stack([x, y], dim=-1)
 
-# Разделение на train/test
+# ============================================
+# 6. Функции визуализации
+# ============================================
+def plot_training_history(losses, save_path):
+    """График истории обучения"""
+    fig, axes = plt.subplots(1, 2, figsize=(18, 6))
+    
+    axes[0].semilogy(losses['total'], 'k-', label='Total Loss', linewidth=2)
+    axes[0].semilogy(losses['data'], 'b-', label='Data Loss', alpha=0.7)
+    axes[0].semilogy(losses['pde'], 'r-', label='PDE Loss', alpha=0.7)
+    axes[0].set_xlabel('Epoch', fontsize=12)
+    axes[0].set_ylabel('Loss (log scale)', fontsize=12)
+    axes[0].set_title('Training History', fontsize=14, fontweight='bold')
+    axes[0].legend(fontsize=10)
+    axes[0].grid(True, alpha=0.3)
+    
+    if 'data_u' in losses:
+        axes[1].semilogy(losses['data_u'], label='Data u', alpha=0.7)
+        axes[1].semilogy(losses['data_v'], label='Data v', alpha=0.7)
+        axes[1].semilogy(losses['data_p'], label='Data p', alpha=0.7)
+    axes[1].set_xlabel('Epoch', fontsize=12)
+    axes[1].set_ylabel('Loss (log scale)', fontsize=12)
+    axes[1].set_title('Data Loss Components', fontsize=14, fontweight='bold')
+    axes[1].legend(fontsize=10)
+    axes[1].grid(True, alpha=0.3)
+    
+    plt.suptitle('DeepONet + PINN: Training Analysis', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def analytical_velocity_profile(u_inlet, x_pos, y_norm):
+    """Аналитическое решение для профиля скорости в сужающемся канале"""
+    h_in = H_IN / 2
+    h_local = channel_width(x_pos)
+    
+    if h_local < 0.01:
+        h_local = 0.01
+    
+    u_max = u_inlet * h_in / h_local
+    u_profile = u_max * (1 - y_norm**2)
+    
+    return u_profile
+
+
+def plot_results_comprehensive_constricted(X, Y, u_pred_2d, v_pred_2d, p_pred_2d, 
+                                          x_wall, y_top, y_bottom, y_grid, save_path, u_inlet=1.0):
+    """Комплексная визуализация для сужающейся трещины с аналитическим решением"""
+    
+    speed = np.sqrt(u_pred_2d**2 + v_pred_2d**2)
+    
+    fig, axes = plt.subplots(2, 4, figsize=(20, 9))
+    
+    # u-скорость
+    im1 = axes[0, 0].pcolormesh(X, Y, u_pred_2d, cmap='RdBu_r', shading='auto')
+    axes[0, 0].plot(x_wall, y_top, 'k-', linewidth=1.5)
+    axes[0, 0].plot(x_wall, y_bottom, 'k-', linewidth=1.5)
+    axes[0, 0].set_title('u-velocity', fontsize=12, fontweight='bold')
+    axes[0, 0].set_xlabel('x')
+    axes[0, 0].set_ylabel('y')
+    axes[0, 0].set_aspect('equal')
+    plt.colorbar(im1, ax=axes[0, 0])
+    
+    # Speed
+    im2 = axes[0, 1].pcolormesh(X, Y, speed, cmap='plasma', shading='auto')
+    axes[0, 1].plot(x_wall, y_top, 'k-', linewidth=1.5)
+    axes[0, 1].plot(x_wall, y_bottom, 'k-', linewidth=1.5)
+    axes[0, 1].set_title('Speed', fontsize=12, fontweight='bold')
+    axes[0, 1].set_xlabel('x')
+    axes[0, 1].set_ylabel('y')
+    axes[0, 1].set_aspect('equal')
+    plt.colorbar(im2, ax=axes[0, 1])
+    
+    # Давление
+    im3 = axes[0, 2].pcolormesh(X, Y, p_pred_2d, cmap='viridis', shading='auto')
+    axes[0, 2].plot(x_wall, y_top, 'k-', linewidth=1.5)
+    axes[0, 2].plot(x_wall, y_bottom, 'k-', linewidth=1.5)
+    axes[0, 2].set_title('Pressure', fontsize=12, fontweight='bold')
+    axes[0, 2].set_xlabel('x')
+    axes[0, 2].set_ylabel('y')
+    axes[0, 2].set_aspect('equal')
+    plt.colorbar(im3, ax=axes[0, 2])
+    
+    # v-скорость
+    im4 = axes[0, 3].pcolormesh(X, Y, v_pred_2d, cmap='RdBu_r', shading='auto')
+    axes[0, 3].plot(x_wall, y_top, 'k-', linewidth=1.5)
+    axes[0, 3].plot(x_wall, y_bottom, 'k-', linewidth=1.5)
+    axes[0, 3].set_title('v-velocity', fontsize=12, fontweight='bold')
+    axes[0, 3].set_xlabel('x')
+    axes[0, 3].set_ylabel('y')
+    axes[0, 3].set_aspect('equal')
+    plt.colorbar(im4, ax=axes[0, 3])
+    
+    # Профили скорости с аналитическим решением
+    throat_idx = np.argmin(np.abs(x_grid - 1.0))
+    inlet_idx = np.argmin(np.abs(x_grid - 0.2))
+    outlet_idx = np.argmin(np.abs(x_grid - 1.8))
+    
+    # Профиль на входе
+    valid_inlet = ~np.isnan(u_pred_2d[:, inlet_idx])
+    if valid_inlet.any():
+        y_inlet = y_grid[valid_inlet]
+        h_inlet = channel_width(x_grid[inlet_idx])
+        
+        # Нормализованная координата для аналитического решения
+        y_norm_inlet = y_inlet / h_inlet
+        
+        # Предсказанный профиль
+        axes[1, 0].plot(u_pred_2d[valid_inlet, inlet_idx], y_inlet, 'b-', label='Predicted', linewidth=2.5)
+        
+        # Аналитический профиль
+        u_analytical_inlet = analytical_velocity_profile(u_inlet, x_grid[inlet_idx], y_norm_inlet)
+        axes[1, 0].plot(u_analytical_inlet, y_inlet, 'r--', label='Analytical', linewidth=2)
+        
+        axes[1, 0].set_title('Velocity Profile at Inlet (x=0.2)', fontsize=11, fontweight='bold')
+        axes[1, 0].set_xlabel('u-velocity', fontsize=10)
+        axes[1, 0].set_ylabel('y', fontsize=10)
+        axes[1, 0].legend(fontsize=9)
+        axes[1, 0].grid(True, alpha=0.3)
+    
+    # Профиль в горле
+    valid_throat = ~np.isnan(u_pred_2d[:, throat_idx])
+    if valid_throat.any():
+        y_throat = y_grid[valid_throat]
+        h_throat = channel_width(x_grid[throat_idx])
+        
+        y_norm_throat = y_throat / h_throat
+        
+        # Предсказанный профиль
+        axes[1, 1].plot(u_pred_2d[valid_throat, throat_idx], y_throat, 'b-', label='Predicted', linewidth=2.5)
+        
+        # Аналитический профиль
+        u_analytical_throat = analytical_velocity_profile(u_inlet, x_grid[throat_idx], y_norm_throat)
+        axes[1, 1].plot(u_analytical_throat, y_throat, 'r--', label='Analytical', linewidth=2)
+        
+        axes[1, 1].set_title('Velocity Profile at Throat (x=1.0)', fontsize=11, fontweight='bold')
+        axes[1, 1].set_xlabel('u-velocity', fontsize=10)
+        axes[1, 1].set_ylabel('y', fontsize=10)
+        axes[1, 1].legend(fontsize=9)
+        axes[1, 1].grid(True, alpha=0.3)
+    
+    # Поле скорости
+    skip = 4
+    mask_quiver = ~np.isnan(u_pred_2d[::skip, ::skip])
+    X_sub = X[::skip, ::skip][mask_quiver]
+    Y_sub = Y[::skip, ::skip][mask_quiver]
+    u_sub = u_pred_2d[::skip, ::skip][mask_quiver]
+    v_sub = v_pred_2d[::skip, ::skip][mask_quiver]
+    
+    axes[1, 2].plot(x_wall, y_top, 'k-', linewidth=1.5)
+    axes[1, 2].plot(x_wall, y_bottom, 'k-', linewidth=1.5)
+    if len(X_sub) > 0:
+        axes[1, 2].quiver(X_sub, Y_sub, u_sub, v_sub, scale=30, width=0.003)
+    axes[1, 2].set_title('Velocity Field', fontsize=12, fontweight='bold')
+    axes[1, 2].set_xlabel('x', fontsize=11)
+    axes[1, 2].set_ylabel('y', fontsize=11)
+    axes[1, 2].set_aspect('equal')
+    axes[1, 2].grid(True, alpha=0.3)
+    
+    # Давление по центру
+    center_idx = np.argmin(np.abs(y_grid))
+    valid_center = ~np.isnan(p_pred_2d[center_idx, :])
+    if valid_center.any():
+        x_center = x_grid[valid_center]
+        p_center = p_pred_2d[center_idx, valid_center]
+        axes[1, 3].plot(x_center, p_center, 'b-', linewidth=2.5, label='Predicted')
+        axes[1, 3].set_title('Pressure along Centerline', fontsize=12, fontweight='bold')
+        axes[1, 3].set_xlabel('x', fontsize=11)
+        axes[1, 3].set_ylabel('Pressure', fontsize=11)
+        axes[1, 3].legend(fontsize=10)
+        axes[1, 3].grid(True, alpha=0.3)
+    
+    plt.suptitle('DeepONet + PINN: Flow in Constricted Fracture', 
+                 fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+# ============================================
+# ОСНОВНОЙ КОД
+# ============================================
+
+# Генерация данных
+print("Генерация данных...")
+sensors, coords, u_true, v_true, p_true = generate_high_quality_data(100, 25)
+
+# Разделение
 train_size = 80
 s_train, s_test = sensors[:train_size], sensors[train_size:]
 c_train, c_test = coords[:train_size], coords[train_size:]
@@ -252,192 +500,266 @@ u_train, u_test = u_true[:train_size], u_true[train_size:]
 v_train, v_test = v_true[:train_size], v_true[train_size:]
 p_train, p_test = p_true[:train_size], p_true[train_size:]
 
-print(f"✅ Train: {train_size}, Test: {len(s_test)}")
+print(f"Train: {train_size}, Test: {len(s_test)}")
+print(f"Форма данных: coords={c_train.shape}, u={u_train.shape}")
 
-# ============================================
-# 6. Обучение
-# ============================================
-print("🚀 Обучение DeepONet + PINN...")
-model = NavierStokesDeepONet(n_sensors=20)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=300, gamma=0.7)
+# Статистика
+u_mean, u_std = u_train.mean(), u_train.std()
+v_mean, v_std = v_train.mean(), v_train.std()
+p_mean, p_std = p_train.mean(), p_train.std()
+print(f"Статистика: u({u_mean:.3f}±{u_std:.3f}), v({v_mean:.3f}±{v_std:.3f}), p({p_mean:.3f}±{p_std:.3f})")
 
-losses = {'total': [], 'data': [], 'pde': []}
+# Переносим на устройство
+s_train = s_train.to(device)
+c_train = c_train.to(device)
+u_train = u_train.to(device)
+v_train = v_train.to(device)
+p_train = p_train.to(device)
+
+# Обучение
+print("\nОбучение DeepONet + PINN v2.2...")
+model = NavierStokesDeepONet(n_sensors=25).to(device)
+
+optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=200, T_mult=2)
+
+losses = {'total': [], 'data': [], 'pde': [], 'data_u': [], 'data_v': [], 'data_p': []}
 best_loss = float('inf')
+best_epoch = 0
 
-for epoch in range(1000):
+n_epochs = 2000
+weights = {'u': 1.0, 'v': 5.0, 'p': 0.5}
+mini_batch_size = 20
+
+for epoch in range(n_epochs):
     model.train()
     
-    # Data loss
-    u_pred, v_pred, p_pred = model(s_train, c_train)
-    loss_data = (torch.mean((u_pred - u_train)**2) + 
-                 torch.mean((v_pred - v_train)**2) + 
-                 torch.mean((p_pred - p_train)**2))
+    total_loss = 0
+    total_loss_data = 0
+    total_loss_pde = 0
+    total_loss_data_u = 0
+    total_loss_data_v = 0
+    total_loss_data_p = 0
     
-    # PDE loss на случайных точках
-    n_pde = 200
-    # Генерируем точки внутри канала
-    x_pde = torch.rand(s_train.shape[0], n_pde) * L
-    y_pde = torch.rand(s_train.shape[0], n_pde) * H_IN - H_IN/2
-    coords_pde = torch.stack([x_pde, y_pde], dim=-1)
+    indices = torch.randperm(train_size)
     
-    # Маскируем точки вне канала (быстро)
-    h_pde = channel_width(x_pde)
-    mask = torch.abs(y_pde) <= h_pde
+    for start_idx in range(0, train_size, mini_batch_size):
+        end_idx = min(start_idx + mini_batch_size, train_size)
+        batch_indices = indices[start_idx:end_idx]
+        
+        s_batch = s_train[batch_indices]
+        c_batch = c_train[batch_indices]
+        u_batch = u_train[batch_indices]
+        v_batch = v_train[batch_indices]
+        p_batch = p_train[batch_indices]
+        
+        u_pred, v_pred, p_pred = model(s_batch, c_batch)
+        loss_u = weights['u'] * torch.mean((u_pred - u_batch)**2)
+        loss_v = weights['v'] * torch.mean((v_pred - v_batch)**2)
+        loss_p = weights['p'] * torch.mean((p_pred - p_batch)**2)
+        loss_data = (loss_u + loss_v + loss_p) / (end_idx - start_idx) * train_size
+        
+        n_pde = 200
+        coords_pde = generate_interior_points(len(batch_indices), n_pde, device)
+        loss_pde = navier_stokes_loss(model, s_batch, coords_pde) / (end_idx - start_idx) * train_size
+        
+        if epoch < 500:
+            pde_weight = 0.01
+        elif epoch < 1000:
+            pde_weight = 0.05
+        else:
+            pde_weight = 0.1
+        
+        loss = loss_data + pde_weight * loss_pde
+        
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        optimizer.step()
+        
+        total_loss += loss.item()
+        total_loss_data += loss_data.item()
+        total_loss_pde += loss_pde.item()
+        total_loss_data_u += loss_u.item()
+        total_loss_data_v += loss_v.item()
+        total_loss_data_p += loss_p.item()
+        
+        del u_pred, v_pred, p_pred, loss, loss_data, loss_pde
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
-    loss_pde = navier_stokes_loss(model, s_train, coords_pde)
+    num_batches = (train_size + mini_batch_size - 1) // mini_batch_size
+    losses['total'].append(total_loss / num_batches)
+    losses['data'].append(total_loss_data / num_batches)
+    losses['pde'].append(total_loss_pde / num_batches)
+    losses['data_u'].append(total_loss_data_u / num_batches)
+    losses['data_v'].append(total_loss_data_v / num_batches)
+    losses['data_p'].append(total_loss_data_p / num_batches)
     
-    # Общая потеря
-    loss = loss_data + 0.1 * loss_pde
+    if epoch % 50 == 0:
+        scheduler.step()
     
-    optimizer.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    optimizer.step()
-    scheduler.step()
+    current_loss = losses['total'][-1]
+    if current_loss < best_loss:
+        best_loss = current_loss
+        best_epoch = epoch
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': best_loss,
+        }, f'{OUT_DIR}/best_model_v2.pth')
     
-    losses['total'].append(loss.item())
-    losses['data'].append(loss_data.item())
-    losses['pde'].append(loss_pde.item())
-    
-    if loss.item() < best_loss:
-        best_loss = loss.item()
-        torch.save(model.state_dict(), f'{OUT_DIR}/best_model.pth')
-    
-    if epoch % 200 == 0:
-        print(f"Epoch {epoch:4d} | Total: {loss.item():.4f} | Data: {loss_data.item():.4f} | PDE: {loss_pde.item():.4f}")
+    if epoch % 100 == 0:
+        print(f"Epoch {epoch:4d}/{n_epochs} | Total: {losses['total'][-1]:.6f} | "
+              f"Data: {losses['data'][-1]:.4f} (u:{losses['data_u'][-1]:.4f}, v:{losses['data_v'][-1]:.4f}, p:{losses['data_p'][-1]:.4f}) | "
+              f"PDE: {losses['pde'][-1]:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
+        
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
 
-print("✅ Обучение завершено!")
-model.load_state_dict(torch.load(f'{OUT_DIR}/best_model.pth'))
+print(f"\nОбучение завершено! Лучшая модель на эпохе {best_epoch}")
+checkpoint = torch.load(f'{OUT_DIR}/best_model_v2.pth', map_location=device)
+model.load_state_dict(checkpoint['model_state_dict'])
 
 # ============================================
-# 7. Визуализация
+# ВИЗУАЛИЗАЦИЯ
 # ============================================
-print("\n📈 Создание визуализации...")
+print("\nСоздание визуализации...")
 
-# Тестовая сетка высокого разрешения
-GRID_NX, GRID_NY = 150, 60
+# График обучения
+plot_training_history(losses, f'{OUT_DIR}/training_history.png')
+
+# Сетка для визуализации
+GRID_NX, GRID_NY = 150, 80
 x_grid = np.linspace(0, L, GRID_NX)
 y_grid = np.linspace(-H_IN/2, H_IN/2, GRID_NY)
 X, Y = np.meshgrid(x_grid, y_grid)
-grid_coords = torch.FloatTensor(np.stack([X.flatten(), Y.flatten()], axis=-1)).unsqueeze(0)
+grid_coords = torch.FloatTensor(np.stack([X.flatten(), Y.flatten()], axis=-1)).unsqueeze(0).to(device)
 
-# Тестируем на новых входных скоростях
-test_cases = [
-    ('Низкая скорость', 0.5),
-    ('Средняя скорость', 1.0),
-    ('Высокая скорость', 1.8),
-]
+# Стены канала
+x_wall = np.linspace(0, L, 500)
+y_top = channel_width(x_wall)
+y_bottom = -channel_width(x_wall)
 
-y_sensors = np.linspace(-H_IN/2, H_IN/2, 20)
+# Выбираем среднюю скорость для визуализации
+u_in = 1.0
+y_sensors = np.linspace(-H_IN/2, H_IN/2, 25)
+sensor_vals = u_in * (1 - (2*y_sensors/H_IN)**2)
+sensors_tensor = torch.FloatTensor(sensor_vals).unsqueeze(0).to(device)
 
-fig, axes = plt.subplots(len(test_cases), 4, figsize=(20, 4*len(test_cases)))
-
-for i, (name, u_in) in enumerate(test_cases):
-    sensor_vals = u_in * (1 - (2*y_sensors/H_IN)**2)
-    sensors_tensor = torch.FloatTensor(sensor_vals).unsqueeze(0)
-    
-    with torch.no_grad():
-        u_pred, v_pred, p_pred = model(sensors_tensor, grid_coords)
-        u_pred = u_pred.squeeze().numpy().reshape(GRID_NY, GRID_NX)
-        v_pred = v_pred.squeeze().numpy().reshape(GRID_NY, GRID_NX)
-        p_pred = p_pred.squeeze().numpy().reshape(GRID_NY, GRID_NX)
-    
-    # Маска геометрии
-    mask = np.zeros_like(X, dtype=bool)
-    for j in range(GRID_NX):
-        mask[:, j] = np.abs(y_grid) <= channel_width(x_grid[j])
-    
-    u_pred[~mask] = np.nan
-    v_pred[~mask] = np.nan
-    p_pred[~mask] = np.nan
-    speed = np.sqrt(u_pred**2 + v_pred**2)
-    
-    # Стены
-    x_wall = np.linspace(0, L, 500)
-    y_top = channel_width(x_wall)
-    y_bottom = -channel_width(x_wall)
-    
-    # u-скорость
-    im1 = axes[i, 0].pcolormesh(X, Y, u_pred, cmap='RdBu_r', shading='auto')
-    axes[i, 0].plot(x_wall, y_top, 'k-', linewidth=1.5)
-    axes[i, 0].plot(x_wall, y_bottom, 'k-', linewidth=1.5)
-    axes[i, 0].set_title(f'{name}: u-velocity (inlet={u_in})')
-    axes[i, 0].set_aspect('equal')
-    plt.colorbar(im1, ax=axes[i, 0])
-    
-    # Магнитуда скорости
-    im2 = axes[i, 1].pcolormesh(X, Y, speed, cmap='plasma', shading='auto')
-    axes[i, 1].plot(x_wall, y_top, 'k-', linewidth=1.5)
-    axes[i, 1].plot(x_wall, y_bottom, 'k-', linewidth=1.5)
-    axes[i, 1].set_title(f'{name}: Speed')
-    axes[i, 1].set_aspect('equal')
-    plt.colorbar(im2, ax=axes[i, 1])
-    
-    # Давление
-    im3 = axes[i, 2].pcolormesh(X, Y, p_pred, cmap='viridis', shading='auto')
-    axes[i, 2].plot(x_wall, y_top, 'k-', linewidth=1.5)
-    axes[i, 2].plot(x_wall, y_bottom, 'k-', linewidth=1.5)
-    axes[i, 2].set_title(f'{name}: Pressure')
-    axes[i, 2].set_aspect('equal')
-    plt.colorbar(im3, ax=axes[i, 2])
-    
-    # Профиль скорости в горловине
-    throat_idx = np.argmin(np.abs(x_grid - 1.0))
-    inlet_idx = np.argmin(np.abs(x_grid - 0.3))
-    
-    y_valid = y_grid[~np.isnan(u_pred[:, throat_idx])]
-    u_throat = u_pred[~np.isnan(u_pred[:, throat_idx]), throat_idx]
-    u_inlet_profile = u_pred[~np.isnan(u_pred[:, inlet_idx]), inlet_idx]
-    y_inlet_valid = y_grid[~np.isnan(u_pred[:, inlet_idx])]
-    
-    axes[i, 3].plot(u_inlet_profile, y_inlet_valid/H_IN*2, 'b-', label='Inlet', linewidth=2)
-    axes[i, 3].plot(u_throat, y_valid/H_THROAT*2, 'r-', label='Throat', linewidth=2)
-    axes[i, 3].set_xlabel('u [m/s]')
-    axes[i, 3].set_ylabel('y/h (normalized)')
-    axes[i, 3].set_title(f'{name}: Velocity Profiles')
-    axes[i, 3].legend()
-    axes[i, 3].grid(True, alpha=0.3)
-
-plt.suptitle('DeepONet + PINN: Течение в сужающейся трещине (Навье-Стокс)', 
-             fontsize=16, fontweight='bold')
-plt.tight_layout()
-plt.savefig(f'{OUT_DIR}/constricted_channel_results.png', dpi=200, bbox_inches='tight')
-plt.close()
-
-# График потерь
-fig_loss, ax_loss = plt.subplots(figsize=(10, 5))
-ax_loss.semilogy(losses['total'], 'k-', label='Total', linewidth=2)
-ax_loss.semilogy(losses['data'], label='Data', alpha=0.7)
-ax_loss.semilogy(losses['pde'], label='PDE', alpha=0.7)
-ax_loss.set_xlabel('Epoch')
-ax_loss.set_ylabel('Loss')
-ax_loss.set_title('DeepONet + PINN Training History')
-ax_loss.legend()
-ax_loss.grid(True, alpha=0.3)
-plt.tight_layout()
-plt.savefig(f'{OUT_DIR}/training_loss.png', dpi=150, bbox_inches='tight')
-plt.close()
-
-# Статистика
 with torch.no_grad():
-    u_test_pred, v_test_pred, p_test_pred = model(s_test, c_test)
-    rel_error_u = torch.norm(u_test_pred - u_test) / torch.norm(u_test)
-    rel_error_v = torch.norm(v_test_pred - v_test) / torch.norm(v_test)
-    rel_error_p = torch.norm(p_test_pred - p_test) / torch.norm(p_test)
+    chunk_size = GRID_NX * GRID_NY // 4
+    u_chunks = []
+    v_chunks = []
+    p_chunks = []
+    
+    for j in range(0, GRID_NX * GRID_NY, chunk_size):
+        end_j = min(j + chunk_size, GRID_NX * GRID_NY)
+        coords_chunk = grid_coords[:, j:end_j, :]
+        u_c, v_c, p_c = model(sensors_tensor, coords_chunk)
+        u_chunks.append(u_c.cpu())
+        v_chunks.append(v_c.cpu())
+        p_chunks.append(p_c.cpu())
+    
+    u_pred = torch.cat(u_chunks, dim=1).squeeze().numpy().reshape(GRID_NY, GRID_NX)
+    v_pred = torch.cat(v_chunks, dim=1).squeeze().numpy().reshape(GRID_NY, GRID_NX)
+    p_pred = torch.cat(p_chunks, dim=1).squeeze().numpy().reshape(GRID_NY, GRID_NX)
 
-print("\n" + "="*60)
-print("📊 Результаты для сужающейся трещины:")
-print("="*60)
-print(f"Относительная ошибка u: {rel_error_u:.4f}")
-print(f"Относительная ошибка v: {rel_error_v:.4f}")
-print(f"Относительная ошибка p: {rel_error_p:.4f}")
-print(f"\n🎯 Геометрия:")
-print(f"• Длина: {L} м")
-print(f"• Вход: {H_IN} м → Горловина: {H_THROAT} м")
-print(f"• Сужение: {X_CONTRACT_1}-{X_CONTRACT_2} м")
-print(f"• Расширение: {X_EXPAND_1}-{X_EXPAND_2} м")
-print(f"• Степень сужения: {H_IN/H_THROAT:.2f}x")
-print(f"\n💡 DeepONet обучен для разных входных скоростей!")
-print(f"📁 Результаты сохранены в: {OUT_DIR}/")
-print("="*60)
+# Маска геометрии
+mask = np.zeros_like(X, dtype=bool)
+for j in range(GRID_NX):
+    mask[:, j] = np.abs(y_grid) <= channel_width(x_grid[j])
+
+u_pred = np.where(mask, u_pred, np.nan)
+v_pred = np.where(mask, v_pred, np.nan)
+p_pred = np.where(mask, p_pred, np.nan)
+
+# Комплексная визуализация с аналитическим решением
+plot_results_comprehensive_constricted(X, Y, u_pred, v_pred, p_pred, 
+                                      x_wall, y_top, y_bottom, y_grid,
+                                      f'{OUT_DIR}/results.png', u_inlet=u_in)
+
+# Оценка на тестовых данных
+print("\nОценка на тестовых данных...")
+with torch.no_grad():
+    s_test = s_test.to(device)
+    c_test = c_test.to(device)
+    u_test = u_test.to(device)
+    v_test = v_test.to(device)
+    p_test = p_test.to(device)
+    
+    test_batch_size = 10
+    u_preds = []
+    v_preds = []
+    p_preds = []
+    
+    for j in range(0, len(s_test), test_batch_size):
+        end_j = min(j + test_batch_size, len(s_test))
+        u_p, v_p, p_p = model(s_test[j:end_j], c_test[j:end_j])
+        u_preds.append(u_p)
+        v_preds.append(v_p)
+        p_preds.append(p_p)
+    
+    u_test_pred = torch.cat(u_preds, dim=0)
+    v_test_pred = torch.cat(v_preds, dim=0)
+    p_test_pred = torch.cat(p_preds, dim=0)
+    
+    rel_error_u = torch.norm(u_test_pred - u_test) / (torch.norm(u_test) + 1e-8)
+    rel_error_v = torch.norm(v_test_pred - v_test) / (torch.norm(v_test) + 1e-8)
+    rel_error_p = torch.norm(p_test_pred - p_test) / (torch.norm(p_test) + 1e-8)
+    
+    r2_u = 1 - torch.sum((u_test - u_test_pred)**2) / (torch.sum((u_test - torch.mean(u_test))**2) + 1e-8)
+    r2_v = 1 - torch.sum((v_test - v_test_pred)**2) / (torch.sum((v_test - torch.mean(v_test))**2) + 1e-8)
+    r2_p = 1 - torch.sum((p_test - p_test_pred)**2) / (torch.sum((p_test - torch.mean(p_test))**2) + 1e-8)
+    
+    mse_u = torch.mean((u_test_pred - u_test)**2).item()
+    mse_v = torch.mean((v_test_pred - v_test)**2).item()
+    mse_p = torch.mean((p_test_pred - p_test)**2).item()
+
+# Вывод результатов
+results_text = f"""
+{'='*60}
+РЕЗУЛЬТАТЫ ОБУЧЕНИЯ DeepONet + PINN v2.2
+{'='*60}
+
+Финальные значения Loss:
+   * Total Loss: {losses['total'][-1]:.4f}
+   * Data Loss: {losses['data'][-1]:.4f}
+   * PDE Loss: {losses['pde'][-1]:.4f}
+
+Относительные L2 ошибки:
+   * u-velocity: {rel_error_u:.4f} ({rel_error_u*100:.2f}%)
+   * v-velocity: {rel_error_v:.4f} ({rel_error_v*100:.2f}%)
+   * pressure:   {rel_error_p:.4f} ({rel_error_p*100:.2f}%)
+
+Среднеквадратичные ошибки (MSE):
+   * u-velocity: {mse_u:.6f}
+   * v-velocity: {mse_v:.6f}
+   * pressure:   {mse_p:.6f}
+
+R² коэффициенты детерминации:
+   * u-velocity: {r2_u:.4f}
+   * v-velocity: {r2_v:.4f}
+   * pressure:   {r2_p:.4f}
+
+Параметры задачи:
+   * Длина трещины L = {L}
+   * Входная ширина H_in = {H_IN}
+   * Ширина горла H_throat = {H_THROAT}
+   * Вязкость nu = {NU}
+   * Плотность rho = {RHO}
+
+Сохраненные файлы:
+   * Модель: {OUT_DIR}/best_model_v2.pth
+   * Графики: {OUT_DIR}/results.png
+   * История обучения: {OUT_DIR}/training_history.png
+"""
+
+print(results_text)
+
+with open(f'{OUT_DIR}/results_summary.txt', 'w', encoding='utf-8') as f:
+    f.write(results_text)
+
+print(f"\nВсе результаты сохранены в папку: {OUT_DIR}/")
