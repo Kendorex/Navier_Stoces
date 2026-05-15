@@ -88,16 +88,11 @@ def poiseuille_profile(y, h, u_max=U_MAX):
     return u_max * (1.0 - (y / h) ** 2)
 
 
-def get_local_poiseuille_profile(x, y):
-    h_local = half_height_numpy(x)
-    return poiseuille_profile(y, h_local, U_MAX)
-
 def navier_stokes_with_gradients(x, y):
     u = tf.cast(y[:, 0:1], tf.float32)
     v = tf.cast(y[:, 1:2], tf.float32)
     p = tf.cast(y[:, 2:3], tf.float32)
     
-    # Производные первого порядка
     u_x = tf.cast(dde.grad.jacobian(u, x, i=0, j=0), tf.float32)
     u_y = tf.cast(dde.grad.jacobian(u, x, i=0, j=1), tf.float32)
     v_x = tf.cast(dde.grad.jacobian(v, x, i=0, j=0), tf.float32)
@@ -105,7 +100,6 @@ def navier_stokes_with_gradients(x, y):
     p_x = tf.cast(dde.grad.jacobian(p, x, i=0, j=0), tf.float32)
     p_y = tf.cast(dde.grad.jacobian(p, x, i=0, j=1), tf.float32)
     
-    # Производные второго порядка
     u_xx = tf.cast(dde.grad.hessian(u, x, i=0, j=0), tf.float32)
     u_yy = tf.cast(dde.grad.hessian(u, x, i=0, j=1), tf.float32)
     v_xx = tf.cast(dde.grad.hessian(v, x, i=0, j=0), tf.float32)
@@ -185,8 +179,6 @@ def train_model():
     print(f"NU={NU}, U_MAX={U_MAX}, H_IN={H_IN}, H_THROAT={H_THROAT}, L={L}")
     print(f"Точки: внутри={N_DOMAIN}, граница={N_BOUNDARY}, тест={N_TEST}")
     print(f"Сеть: {layer_size}")
-    print(f"gPINN: 3 PDE + 6 градиентов PDE в loss")
-    print(f"Adam итерации: {ITERATIONS_ADAM}")
     print()
 
     model.compile("adam", lr=LR_ADAM, loss_weights=loss_weights)
@@ -207,15 +199,6 @@ def train_model():
     return losshistory, train_state
 
 
-def _stack_operator_result(res):
-    if isinstance(res, list):
-        return np.hstack([np.asarray(r).reshape(-1, 1) for r in res])
-    res = np.asarray(res)
-    if res.ndim == 1:
-        return res.reshape(-1, 1)
-    return res
-
-
 def predict_on_grid(nx=GRID_NX, ny=GRID_NY):
     xs = np.linspace(0.0, L, nx)
     ys = np.linspace(-H_IN, H_IN, ny)
@@ -225,50 +208,18 @@ def predict_on_grid(nx=GRID_NX, ny=GRID_NY):
     inside = geom.inside(pts)
     pts_inside = pts[inside]
     pred = model.predict(pts_inside)
-    res = _stack_operator_result(model.predict(pts_inside, operator=navier_stokes_with_gradients))
-    res_pde = res[:, :3] if res.shape[1] >= 3 else res
 
     u = np.full(xx.size, np.nan)
     v = np.full(xx.size, np.nan)
     p = np.full(xx.size, np.nan)
     speed = np.full(xx.size, np.nan)
-    cont = np.full(xx.size, np.nan)
 
     u[inside] = pred[:, 0]
     v[inside] = pred[:, 1]
     p[inside] = pred[:, 2]
     speed[inside] = np.sqrt(pred[:, 0] ** 2 + pred[:, 1] ** 2)
-    cont[inside] = np.abs(res_pde[:, 2])
 
-    return (xx, yy, inside.reshape(xx.shape), u.reshape(xx.shape),
-            v.reshape(xx.shape), p.reshape(xx.shape), speed.reshape(xx.shape),
-            cont.reshape(xx.shape))
-
-
-
-def draw_geometry(ax):
-    poly = np.array(points + [points[0]])
-    ax.plot(poly[:, 0], poly[:, 1], linewidth=1.7, color='black')
-    ax.set_xlim(0.0, L)
-    ax.set_ylim(-H_IN * 1.05, H_IN * 1.05)
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_aspect("equal", adjustable="box")
-
-
-def preview_geometry(filename=None, n=8000):
-    if filename is None:
-        filename = os.path.join(OUT_DIR, "geometry_preview.png")
-    pts = geom.random_points(n)
-    plt.figure(figsize=(9, 3.5))
-    plt.scatter(pts[:, 0], pts[:, 1], s=1, alpha=0.5)
-    ax = plt.gca()
-    draw_geometry(ax)
-    ax.set_title("Геометрия: труба с линейным сужением (gPINN)")
-    plt.tight_layout()
-    plt.savefig(filename, dpi=160)
-    plt.close()
-    print(f"Сохранено: {filename}")
+    return xx, yy, u.reshape(xx.shape), v.reshape(xx.shape), p.reshape(xx.shape), speed.reshape(xx.shape)
 
 
 def plot_training_loss(losshistory, filename=None):
@@ -282,9 +233,9 @@ def plot_training_loss(losshistory, filename=None):
     plt.figure(figsize=(8, 4.2))
     plt.semilogy(steps, train_loss_total, 'b-', label='Train loss', linewidth=2)
     plt.semilogy(steps, test_loss_total, 'r--', label='Test loss', linewidth=2)
-    plt.xlabel("итерация")
-    plt.ylabel("общая ошибка")
-    plt.title("Ошибка обучения gPINN")
+    plt.xlabel("Iteration")
+    plt.ylabel("Total Loss")
+    plt.title("gPINN Training Loss")
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -293,324 +244,143 @@ def plot_training_loss(losshistory, filename=None):
     print(f"Сохранено: {filename}")
 
 
-def plot_field(field, title, filename, xx, yy, levels=60):
-    plt.figure(figsize=(9, 3.5))
-    plt.contourf(xx, yy, field, levels=levels, cmap='jet')
-    plt.colorbar(label=title)
-    ax = plt.gca()
-    draw_geometry(ax)
-    ax.set_title(f"gPINN: {title}")
-    plt.tight_layout()
-    plt.savefig(filename, dpi=170)
-    plt.close()
-    print(f"Сохранено: {filename}")
-
-
-def plot_streamlines(xx, yy, u, v, speed, filename=None):
+def plot_results_comprehensive(xx, yy, u, v, p, speed, filename=None):
+    """Комплексная визуализация в формате 2x4"""
     if filename is None:
-        filename = os.path.join(OUT_DIR, "streamlines.png")
-    plt.figure(figsize=(9, 3.5))
-    plt.contourf(xx, yy, speed, levels=60, cmap='jet')
-    plt.colorbar(label="speed")
-    plt.streamplot(
-        xx, yy,
-        np.nan_to_num(u, nan=0.0),
-        np.nan_to_num(v, nan=0.0),
-        density=1.4, linewidth=0.85, color='white', arrowsize=0.8,
-    )
-    ax = plt.gca()
-    draw_geometry(ax)
-    ax.set_title("gPINN: Линии тока")
+        filename = os.path.join(OUT_DIR, "comprehensive_results.png")
+    
+    fig, axes = plt.subplots(2, 4, figsize=(20, 9))
+    
+    # Стены канала
+    x_wall = np.linspace(0, L, 500)
+    y_top = half_height_numpy(x_wall)
+    y_bottom = -half_height_numpy(x_wall)
+    
+    # u-скорость
+    im1 = axes[0, 0].contourf(xx, yy, u, levels=30, cmap='RdBu_r')
+    axes[0, 0].plot(x_wall, y_top, 'k-', linewidth=1.5)
+    axes[0, 0].plot(x_wall, y_bottom, 'k-', linewidth=1.5)
+    axes[0, 0].set_title('u-velocity', fontsize=12, fontweight='bold')
+    axes[0, 0].set_xlabel('x')
+    axes[0, 0].set_ylabel('y')
+    axes[0, 0].set_aspect('equal')
+    plt.colorbar(im1, ax=axes[0, 0])
+    
+    # Speed
+    im2 = axes[0, 1].contourf(xx, yy, speed, levels=30, cmap='plasma')
+    axes[0, 1].plot(x_wall, y_top, 'k-', linewidth=1.5)
+    axes[0, 1].plot(x_wall, y_bottom, 'k-', linewidth=1.5)
+    axes[0, 1].set_title('Speed', fontsize=12, fontweight='bold')
+    axes[0, 1].set_xlabel('x')
+    axes[0, 1].set_ylabel('y')
+    axes[0, 1].set_aspect('equal')
+    plt.colorbar(im2, ax=axes[0, 1])
+    
+    # Давление
+    im3 = axes[0, 2].contourf(xx, yy, p, levels=30, cmap='viridis')
+    axes[0, 2].plot(x_wall, y_top, 'k-', linewidth=1.5)
+    axes[0, 2].plot(x_wall, y_bottom, 'k-', linewidth=1.5)
+    axes[0, 2].set_title('Pressure', fontsize=12, fontweight='bold')
+    axes[0, 2].set_xlabel('x')
+    axes[0, 2].set_ylabel('y')
+    axes[0, 2].set_aspect('equal')
+    plt.colorbar(im3, ax=axes[0, 2])
+    
+    # v-скорость
+    im4 = axes[0, 3].contourf(xx, yy, v, levels=30, cmap='RdBu_r')
+    axes[0, 3].plot(x_wall, y_top, 'k-', linewidth=1.5)
+    axes[0, 3].plot(x_wall, y_bottom, 'k-', linewidth=1.5)
+    axes[0, 3].set_title('v-velocity', fontsize=12, fontweight='bold')
+    axes[0, 3].set_xlabel('x')
+    axes[0, 3].set_ylabel('y')
+    axes[0, 3].set_aspect('equal')
+    plt.colorbar(im4, ax=axes[0, 3])
+    
+    # Профили скорости
+    xs = np.linspace(0.0, L, xx.shape[1])
+    ys = np.linspace(-H_IN, H_IN, xx.shape[0])
+    
+    throat_idx = np.argmin(np.abs(xs - 1.0))
+    inlet_idx = np.argmin(np.abs(xs - 0.2))
+    
+    valid_inlet = ~np.isnan(u[:, inlet_idx])
+    if valid_inlet.any():
+        y_inlet = ys[valid_inlet]
+        h_inlet = half_height_numpy(np.array([xs[inlet_idx]]))[0]
+        
+        axes[1, 0].plot(u[valid_inlet, inlet_idx], y_inlet, 'b-', label='gPINN', linewidth=2.5)
+        u_theory = poiseuille_profile(y_inlet, h_inlet, U_MAX)
+        axes[1, 0].plot(u_theory, y_inlet, 'r--', label='Poiseuille', linewidth=2)
+        
+        axes[1, 0].set_title('Velocity Profile at Inlet (x=0.2)', fontsize=11, fontweight='bold')
+        axes[1, 0].set_xlabel('u-velocity', fontsize=10)
+        axes[1, 0].set_ylabel('y', fontsize=10)
+        axes[1, 0].legend(fontsize=9)
+        axes[1, 0].grid(True, alpha=0.3)
+    
+    valid_throat = ~np.isnan(u[:, throat_idx])
+    if valid_throat.any():
+        y_throat = ys[valid_throat]
+        h_throat = half_height_numpy(np.array([xs[throat_idx]]))[0]
+        
+        axes[1, 1].plot(u[valid_throat, throat_idx], y_throat, 'b-', label='gPINN', linewidth=2.5)
+        u_theory = poiseuille_profile(y_throat, h_throat, U_MAX)
+        axes[1, 1].plot(u_theory, y_throat, 'r--', label='Poiseuille', linewidth=2)
+        
+        axes[1, 1].set_title('Velocity Profile at Throat (x=1.0)', fontsize=11, fontweight='bold')
+        axes[1, 1].set_xlabel('u-velocity', fontsize=10)
+        axes[1, 1].set_ylabel('y', fontsize=10)
+        axes[1, 1].legend(fontsize=9)
+        axes[1, 1].grid(True, alpha=0.3)
+    
+    # Поле скорости
+    step = 15
+    mask = ~np.isnan(u[::step, ::step])
+    X_sub = xx[::step, ::step][mask]
+    Y_sub = yy[::step, ::step][mask]
+    u_sub = u[::step, ::step][mask]
+    v_sub = v[::step, ::step][mask]
+    
+    axes[1, 2].plot(x_wall, y_top, 'k-', linewidth=1.5)
+    axes[1, 2].plot(x_wall, y_bottom, 'k-', linewidth=1.5)
+    if len(X_sub) > 0:
+        axes[1, 2].quiver(X_sub, Y_sub, u_sub, v_sub, scale=25, width=0.003)
+    axes[1, 2].set_title('Velocity Field', fontsize=12, fontweight='bold')
+    axes[1, 2].set_xlabel('x', fontsize=11)
+    axes[1, 2].set_ylabel('y', fontsize=11)
+    axes[1, 2].set_aspect('equal')
+    axes[1, 2].grid(True, alpha=0.3)
+    
+    # Давление по центру
+    center_idx = np.argmin(np.abs(ys))
+    valid_center = ~np.isnan(p[center_idx, :])
+    if valid_center.any():
+        x_center = xs[valid_center]
+        p_center = p[center_idx, valid_center]
+        axes[1, 3].plot(x_center, p_center, 'b-', linewidth=2.5)
+        axes[1, 3].set_title('Pressure along Centerline', fontsize=12, fontweight='bold')
+        axes[1, 3].set_xlabel('x', fontsize=11)
+        axes[1, 3].set_ylabel('Pressure', fontsize=11)
+        axes[1, 3].grid(True, alpha=0.3)
+    
+    plt.suptitle('gPINN: Flow in Constricted Channel', fontsize=14, fontweight='bold')
     plt.tight_layout()
-    plt.savefig(filename, dpi=170)
+    plt.savefig(filename, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"Сохранено: {filename}")
-
-
-def plot_quiver(xx, yy, u, v, speed, filename=None):
-    if filename is None:
-        filename = os.path.join(OUT_DIR, "quiver.png")
-    step = 12
-    plt.figure(figsize=(9, 3.5))
-    plt.contourf(xx, yy, speed, levels=50, cmap='jet')
-    plt.colorbar(label="speed")
-    plt.quiver(
-        xx[::step, ::step], yy[::step, ::step],
-        np.nan_to_num(u[::step, ::step], nan=0.0),
-        np.nan_to_num(v[::step, ::step], nan=0.0),
-        scale=25, alpha=0.7,
-    )
-    ax = plt.gca()
-    draw_geometry(ax)
-    ax.set_title("gPINN: Векторы скорости")
-    plt.tight_layout()
-    plt.savefig(filename, dpi=170)
-    plt.close()
-    print(f"Сохранено: {filename}")
-
-
-def plot_profiles(filename=None, n=250):
-    if filename is None:
-        filename = os.path.join(OUT_DIR, "profiles.png")
-
-    x = np.linspace(0.0, L, n)[:, None].astype(np.float32)
-    center = np.hstack([x, np.zeros_like(x)]).astype(np.float32)
-    pred_center = model.predict(center)
-
-    cuts = [0.20, 0.50, 0.80, 1.0, 1.2]
-
-    fig, axes = plt.subplots(1, 2, figsize=(10, 3.8))
-    axes[0].plot(center[:, 0], pred_center[:, 0], 'b-', label="u(x, 0)")
-    axes[0].plot(center[:, 0], pred_center[:, 1], 'r-', label="v(x, 0)")
-    axes[0].set_title("gPINN: Скорость по оси трубы")
-    axes[0].set_xlabel("x")
-    axes[0].grid(True, alpha=0.3)
-    axes[0].legend()
-
-    for x_cut in cuts:
-        h = float(half_height_numpy(np.array([x_cut]))[0])
-        y = np.linspace(-h * 0.98, h * 0.98, n)[:, None].astype(np.float32)
-        x_col = np.full_like(y, x_cut, dtype=np.float32)
-        pts = np.hstack([x_col, y])
-        pred = model.predict(pts)
-        axes[1].plot(pred[:, 0], y[:, 0], label=f"x={x_cut:.2f}")
-
-    axes[1].set_title("gPINN: Профили u по вертикальным срезам")
-    axes[1].set_xlabel("u")
-    axes[1].set_ylabel("y")
-    axes[1].grid(True, alpha=0.3)
-    axes[1].legend()
-
-    plt.tight_layout()
-    plt.savefig(filename, dpi=170)
-    plt.close()
-    print(f"Сохранено: {filename}")
-
-
-# -------------------------
-# 10. Сравнение gPINN с теорией Пуазейля
-# -------------------------
-
-def plot_gpinn_vs_poiseuille(filename=None, n_profile=200):
-    """
-    Сравнение решения gPINN с теоретическим профилем Пуазейля
-    на входном и выходном участках канала
-    """
-    if filename is None:
-        filename = os.path.join(OUT_DIR, "gpinn_vs_poiseuille.png")
-    
-    # Сечения для сравнения
-    cuts = [
-        (0.1, "x = 0.10 (вход)"),
-        (0.5, "x = 0.50 (до сужения)"),
-        (1.5, "x = 1.50 (после расширения)"),
-        (1.9, "x = 1.90 (выход)")
-    ]
-    
-    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
-    axes = axes.ravel()
-    
-    for idx, (x_cut, title) in enumerate(cuts):
-        h_local = float(half_height_numpy(np.array([x_cut]))[0])
-        y = np.linspace(-h_local * 0.99, h_local * 0.99, n_profile)[:, None].astype(np.float32)
-        x_col = np.full_like(y, x_cut, dtype=np.float32)
-        pts = np.hstack([x_col, y])
-        
-        # gPINN решение
-        pred = model.predict(pts)
-        u_gpinn = pred[:, 0]
-        
-        # Теоретический профиль Пуазейля
-        u_theory = poiseuille_profile(y.flatten(), h_local, U_MAX)
-        
-        # Ошибка
-        error = np.mean(np.abs(u_gpinn - u_theory))
-        
-        axes[idx].plot(u_gpinn, y, 'b-', linewidth=2, label=f'gPINN (error={error:.4f})')
-        axes[idx].plot(u_theory, y, 'r--', linewidth=2, label='Poiseuille theory')
-        axes[idx].set_xlabel('u(x, y)')
-        axes[idx].set_ylabel('y')
-        axes[idx].set_title(title)
-        axes[idx].legend()
-        axes[idx].grid(True, alpha=0.3)
-        
-        # Добавляем границы канала
-        axes[idx].axhline(y=h_local, color='k', linestyle='-', alpha=0.5)
-        axes[idx].axhline(y=-h_local, color='k', linestyle='-', alpha=0.5)
-    
-    plt.suptitle('gPINN vs Poiseuille Theory: Профили скорости в различных сечениях', fontsize=12)
-    plt.tight_layout()
-    plt.savefig(filename, dpi=170)
-    plt.close()
-    print(f"Сохранено: {filename}")
-    
-    return cuts
-
-
-def plot_error_analysis(filename=None, n_profile=200):
-    """
-    Анализ ошибки gPINN относительно теории Пуазейля вдоль канала
-    """
-    if filename is None:
-        filename = os.path.join(OUT_DIR, "error_analysis.png")
-    
-    x_positions = np.linspace(0.05, L - 0.05, 30)
-    errors = []
-    
-    for x_cut in x_positions:
-        h_local = float(half_height_numpy(np.array([x_cut]))[0])
-        y = np.linspace(-h_local * 0.95, h_local * 0.95, 50)[:, None].astype(np.float32)
-        x_col = np.full_like(y, x_cut, dtype=np.float32)
-        pts = np.hstack([x_col, y])
-        
-        pred = model.predict(pts)
-        u_gpinn = pred[:, 0]
-        u_theory = poiseuille_profile(y.flatten(), h_local, U_MAX)
-        
-        # Относительная ошибка
-        rel_error = np.mean(np.abs(u_gpinn - u_theory)) / (np.mean(np.abs(u_theory)) + 1e-8)
-        errors.append(rel_error)
-    
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-    
-    # График ошибки
-    ax1.semilogy(x_positions, errors, 'b-o', markersize=4, linewidth=1.5)
-    ax1.axvline(x=X_CONTRACT_1, color='gray', linestyle='--', alpha=0.5, label='Начало сужения')
-    ax1.axvline(x=X_CONTRACT_2, color='gray', linestyle='--', alpha=0.5, label='Конец сужения')
-    ax1.axvline(x=X_EXPAND_1, color='gray', linestyle='--', alpha=0.5)
-    ax1.axvline(x=X_EXPAND_2, color='gray', linestyle='--', alpha=0.5)
-    ax1.set_xlabel('x')
-    ax1.set_ylabel('Относительная ошибка')
-    ax1.set_title('Ошибка gPINN относительно теории Пуазейля')
-    ax1.grid(True, alpha=0.3)
-    ax1.legend()
-    
-    # Гистограмма ошибки
-    ax2.hist(errors, bins=20, color='steelblue', edgecolor='black', alpha=0.7)
-    ax2.set_xlabel('Относительная ошибка')
-    ax2.set_ylabel('Частота')
-    ax2.set_title('Распределение ошибки по сечениям')
-    ax2.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(filename, dpi=170)
-    plt.close()
-    print(f"Сохранено: {filename}")
-
-
-def plot_poiseuille_comparison_summary(filename=None, n_profile=150):
-    """
-    Комплексное сравнение gPINN с теорией Пуазейля
-    """
-    if filename is None:
-        filename = os.path.join(OUT_DIR, "poiseuille_comparison_summary.png")
-    
-    # Выбираем сечения
-    cuts_x = [0.1, 0.5, 1.5, 1.9]
-    colors = ['blue', 'green', 'orange', 'red']
-    
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    for x_cut, color in zip(cuts_x, colors):
-        h_local = float(half_height_numpy(np.array([x_cut]))[0])
-        y = np.linspace(-h_local * 0.99, h_local * 0.99, n_profile)[:, None].astype(np.float32)
-        x_col = np.full_like(y, x_cut, dtype=np.float32)
-        pts = np.hstack([x_col, y])
-        
-        pred = model.predict(pts)
-        u_gpinn = pred[:, 0]
-        u_theory = poiseuille_profile(y.flatten(), h_local, U_MAX)
-        
-        ax.plot(u_gpinn, y, color=color, linewidth=2, 
-                label=f'gPINN x={x_cut}')
-        ax.plot(u_theory, y, color=color, linestyle='--', linewidth=1.5, alpha=0.7)
-    
-    ax.set_xlabel('u(x, y)')
-    ax.set_ylabel('y')
-    ax.set_title('gPINN (сплошные) vs Poiseuille Theory (пунктир)\nв различных сечениях канала')
-    ax.legend(loc='best', fontsize=9)
-    ax.grid(True, alpha=0.3)
-    
-    # Добавляем информацию о параметрах
-    text_str = f'Re = {U_MAX * 2 * H_IN / NU:.1f}\nNU = {NU}\nU_MAX = {U_MAX}'
-    ax.text(0.02, 0.98, text_str, transform=ax.transAxes, fontsize=10,
-            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    
-    plt.tight_layout()
-    plt.savefig(filename, dpi=170)
-    plt.close()
-    print(f"Сохранено: {filename}")
-
-
-# -------------------------
-# 11. Диагностика
-# -------------------------
-
-def check_model(n_samples=800):
-    pts = geom.random_points(n_samples).astype(np.float32)
-    pred = model.predict(pts)
-    res = _stack_operator_result(model.predict(pts, operator=navier_stokes_with_gradients))
-    res_pde = res[:, :3] if res.shape[1] >= 3 else res
-    speed = np.sqrt(pred[:, 0] ** 2 + pred[:, 1] ** 2)
-
-    print()
-    print("Быстрая диагностика gPINN:")
-    print(f"  mean |u|              = {np.mean(np.abs(pred[:, 0])):.4e}")
-    print(f"  mean |v|              = {np.mean(np.abs(pred[:, 1])):.4e}")
-    print(f"  mean |p|              = {np.mean(np.abs(pred[:, 2])):.4e}")
-    print(f"  mean speed            = {np.mean(speed):.4e}")
-    print(f"  max speed             = {np.max(speed):.4e}")
-    print(f"  mean |mom_x residual| = {np.mean(np.abs(res_pde[:, 0])):.4e}")
-    print(f"  mean |mom_y residual| = {np.mean(np.abs(res_pde[:, 1])):.4e}")
-    print(f"  mean |continuity|     = {np.mean(np.abs(res_pde[:, 2])):.4e}")
-    print(f"  gPINN: +6 gradient terms in loss")
-
-
-# -------------------------
-# 12. Сохранение результатов
-# -------------------------
-
-def save_grid_data(filename=None):
-    if filename is None:
-        filename = os.path.join(OUT_DIR, "grid_data.csv")
-    xx, yy, inside, u, v, p, speed, cont = predict_on_grid()
-    out = np.column_stack([
-        xx.ravel(), yy.ravel(), inside.ravel().astype(int),
-        u.ravel(), v.ravel(), p.ravel(), speed.ravel(), cont.ravel(),
-    ])
-    np.savetxt(filename, out, delimiter=",", 
-               header="x,y,inside,u,v,p,speed,continuity_abs", comments="")
     print(f"Сохранено: {filename}")
 
 
 def create_all_outputs(losshistory):
-    xx, yy, inside, u, v, p, speed, cont = predict_on_grid()
+    xx, yy, u, v, p, speed = predict_on_grid()
     
     plot_training_loss(losshistory)
-    plot_field(speed, "Модуль скорости", os.path.join(OUT_DIR, "speed_map.png"), xx, yy)
-    plot_field(p, "Давление", os.path.join(OUT_DIR, "pressure_map.png"), xx, yy)
-    plot_field(cont, "|Ошибка неразрывности|", os.path.join(OUT_DIR, "continuity_map.png"), xx, yy)
-    plot_streamlines(xx, yy, u, v, speed)
-    plot_quiver(xx, yy, u, v, speed)
-    plot_profiles()
+    plot_results_comprehensive(xx, yy, u, v, p, speed)
     
-    # Дополнительные графики сравнения с теорией Пуазейля
-    plot_gpinn_vs_poiseuille()
-    plot_error_analysis()
-    plot_poiseuille_comparison_summary()
-    
-    save_grid_data()
+    print(f"Все результаты сохранены в папку: {OUT_DIR}")
 
-
-# -------------------------
-# 13. Запуск
-# -------------------------
 
 if __name__ == "__main__":
-    preview_geometry()
     losshistory, train_state = train_model()
-    check_model()
     create_all_outputs(losshistory)
     print()
-    print(f"✅ Все результаты gPINN сохранены в папке: {OUT_DIR}")
-    print("📊 gPINN добавляет 6 градиентных членов в функцию потерь")
+    print(f"gPINN обучение завершено! Результаты в: {OUT_DIR}")
