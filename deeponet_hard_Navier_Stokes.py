@@ -7,10 +7,6 @@ import os
 import gc
 from matplotlib.colors import Normalize
 
-# ============================================
-# УЛУЧШЕННАЯ ВЕРСИЯ 2.2: DeepONet + PINN
-# ============================================
-
 # Параметры геометрии с сужением
 L = 2.0
 H_IN = 0.50
@@ -24,7 +20,6 @@ X_EXPAND_2 = 1.25
 RHO = 1.0
 NU = 0.02
 
-# Директория для сохранения
 OUT_DIR = "deeponet_constricted_v2"
 os.makedirs(OUT_DIR, exist_ok=True)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -35,9 +30,7 @@ if torch.cuda.is_available():
     torch.cuda.empty_cache()
     gc.collect()
 
-# ============================================
 # 1. Геометрия сужающейся трещины
-# ============================================
 def channel_width(x):
     """Полуширина канала в точке x"""
     if isinstance(x, torch.Tensor):
@@ -57,12 +50,10 @@ def channel_width(x):
         t_smooth_contract = np.sin(np.pi * t_contract / 2)**2
         w[mask_contract] = (H_IN/2)*(1-t_smooth_contract) + (H_THROAT/2)*t_smooth_contract
     
-    # Горло
     mask_throat = (x_np > X_CONTRACT_2) & (x_np <= X_EXPAND_1)
     if mask_throat.any():
         w[mask_throat] = H_THROAT / 2
     
-    # Расширение
     mask_expand = (x_np > X_EXPAND_1) & (x_np <= X_EXPAND_2)
     if mask_expand.any():
         t_expand = (x_np[mask_expand] - X_EXPAND_1) / (X_EXPAND_2 - X_EXPAND_1)
@@ -73,9 +64,7 @@ def channel_width(x):
         return torch.tensor(w, device=device_orig, dtype=torch.float32)
     return w
 
-# ============================================
-# 2. Архитектура DeepONet с оптимизацией памяти
-# ============================================
+# 2 deeponet
 class ImprovedDeepONet2D(nn.Module):
     def __init__(self, n_sensors=20, hidden_dim=128, n_layers=3):
         super().__init__()
@@ -83,7 +72,7 @@ class ImprovedDeepONet2D(nn.Module):
         self.fourier_features = 32
         self.trunk_input_dim = 2 + 4 * self.fourier_features
         
-        # Branch network
+        # branch network
         branch_layers = []
         input_dim = n_sensors
         
@@ -96,7 +85,7 @@ class ImprovedDeepONet2D(nn.Module):
         
         self.branch = nn.Sequential(*branch_layers)
         
-        # Trunk network
+        # trunk network
         trunk_layers = []
         trunk_layers.append(nn.Linear(self.trunk_input_dim, hidden_dim))
         trunk_layers.append(nn.LayerNorm(hidden_dim))
@@ -169,9 +158,7 @@ class NavierStokesDeepONet(nn.Module):
         p = self.p_net(sensor_vals, coords)
         return u, v, p
 
-# ============================================
-# 3. Physics-Informed Loss с оптимизацией памяти
-# ============================================
+
 def navier_stokes_loss(model, sensor_vals, coords):
     coords = coords.detach().requires_grad_(True)
     u, v, p = model(sensor_vals, coords)
@@ -207,9 +194,7 @@ def navier_stokes_loss(model, sensor_vals, coords):
     
     return loss
 
-# ============================================
 # 4. Генерация данных
-# ============================================
 def generate_high_quality_data(n_samples=100, n_sensors=30):
     print(f"Генерация {n_samples} сэмплов...")
     
@@ -291,9 +276,7 @@ def generate_high_quality_data(n_samples=100, n_sensors=30):
             torch.FloatTensor(np.array(all_v)),
             torch.FloatTensor(np.array(all_p)))
 
-# ============================================
 # 5. Генерация точек
-# ============================================
 def generate_interior_points(batch_size, n_points, device):
     x = torch.rand(batch_size, n_points, device=device) * L
     y = (torch.rand(batch_size, n_points, device=device) - 0.5) * H_IN
@@ -304,11 +287,8 @@ def generate_interior_points(batch_size, n_points, device):
     
     return torch.stack([x, y], dim=-1)
 
-# ============================================
 # 6. Функции визуализации
-# ============================================
 def plot_training_history(losses, save_path):
-    """График истории обучения"""
     fig, axes = plt.subplots(1, 2, figsize=(18, 6))
     
     axes[0].semilogy(losses['total'], 'k-', label='Total Loss', linewidth=2)
@@ -337,7 +317,6 @@ def plot_training_history(losses, save_path):
 
 
 def analytical_velocity_profile(u_inlet, x_pos, y_norm):
-    """Аналитическое решение для профиля скорости в сужающемся канале"""
     h_in = H_IN / 2
     h_local = channel_width(x_pos)
     
@@ -352,8 +331,6 @@ def analytical_velocity_profile(u_inlet, x_pos, y_norm):
 
 def plot_results_comprehensive_constricted(X, Y, u_pred_2d, v_pred_2d, p_pred_2d, 
                                           x_wall, y_top, y_bottom, y_grid, save_path, u_inlet=1.0):
-    """Комплексная визуализация для сужающейся трещины с аналитическим решением"""
-    
     speed = np.sqrt(u_pred_2d**2 + v_pred_2d**2)
     
     fig, axes = plt.subplots(2, 4, figsize=(20, 9))
