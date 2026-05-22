@@ -18,7 +18,7 @@ os.makedirs(f"{results_dir}/models", exist_ok=True)
 
 print(f"Результаты будут сохранены в папку: {results_dir}")
 
-# 1. Архитектура DeepONet для 2D
+# архитектура DeepONet
 class DeepONet2D(nn.Module):
     def __init__(self, n_sensors=10, hidden_dim=40):
         super().__init__()
@@ -43,8 +43,7 @@ class DeepONet2D(nn.Module):
         t = self.trunk(coords)
         return torch.sum(b.unsqueeze(1) * t, dim=-1)
 
-
-# 2. Полная модель для скорости и давления
+# полная модель для скорости и давления
 class NavierStokesDeepONet(nn.Module):
     def __init__(self, n_sensors=10):
         super().__init__()
@@ -89,7 +88,7 @@ def navier_stokes_loss(model, boundary_vals, coords, nu=0.01):
 # 4. Генерация данных для течения Пуазейля в трещине
 def make_poiseuille_data(n_samples=100, n_sensors=10):
     nu = 0.01
-    H = 1.0
+    H = 0.5
     L = 2.0
     
     y_sensors = np.linspace(0, H, n_sensors)
